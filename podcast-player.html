@@ -95,6 +95,16 @@ input[type=range]{flex:1;height:48px;accent-color:var(--accent);background:trans
   </section>
   <section class="panel" style="font-size:16px;color:var(--mute)">
     Ads recorded into an episode can't be removed. Use +90 to jump past them. Progress is saved for every episode.
+    <details style="margin-top:12px">
+      <summary style="cursor:pointer;min-height:44px;display:flex;align-items:center;color:var(--fg)">Settings: backup episode source (Podcast Index)</summary>
+      <p style="margin:6px 0 10px">Used when a show's episodes won't load. Get a free key at api.podcastindex.org, then paste it here. It stays in this browser only.</p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <input id="piKey" placeholder="API key" autocomplete="off" style="flex:1;min-width:140px;height:56px;border-radius:14px;border:2px solid var(--line);background:var(--bg);padding:0 14px">
+        <input id="piSecret" placeholder="API secret" autocomplete="off" style="flex:1;min-width:140px;height:56px;border-radius:14px;border:2px solid var(--line);background:var(--bg);padding:0 14px">
+        <button id="piSave" style="min-height:56px">Save</button>
+      </div>
+      <div id="piMsg" style="margin-top:8px"></div>
+    </details>
   </section>
 </div>
 
@@ -121,7 +131,9 @@ input[type=range]{flex:1;height:48px;accent-color:var(--accent);background:trans
   var PROXIES = [
     function(u){return u},
     function(u){return "https://corsproxy.io/?url="+encodeURIComponent(u)},
-    function(u){return "https://api.allorigins.win/raw?url="+encodeURIComponent(u)}
+    function(u){return "https://api.allorigins.win/raw?url="+encodeURIComponent(u)},
+    function(u){return "https://api.codetabs.com/v1/proxy?quest="+encodeURIComponent(u)},
+    function(u){return "https://thingproxy.freeboard.io/fetch/"+u}
   ];
 
   // ---------- storage ----------
@@ -163,10 +175,27 @@ input[type=range]{flex:1;height:48px;accent-color:var(--accent);background:trans
     });
   }
   function itunes(term){
-    var url = "https://itunes.apple.com/search?media=podcast&limit=25&term=" + encodeURIComponent(term);
+    return apiGet("https://itunes.apple.com/search?media=podcast&limit=25&term=" + encodeURIComponent(term));
+  }
+  function apiGet(url){
     return fetch(url).then(function(r){ if(!r.ok) throw new Error("status "+r.status); return r.json(); })
       .catch(function(){ return jsonp(url); })
       .catch(function(){ return fetchText(url).then(JSON.parse); });
+  }
+  // Podcast Index (free key from api.podcastindex.org), used when Apple's directory lacks a show's episodes
+  function sha1hex(str){
+    return crypto.subtle.digest("SHA-1", new TextEncoder().encode(str)).then(function(b){
+      return Array.prototype.map.call(new Uint8Array(b), function(x){ return x.toString(16).padStart(2,"0"); }).join("");
+    });
+  }
+  function piGet(path){
+    var k = load("dp.pi", null);
+    if(!k || !k.key || !k.secret) return Promise.reject(new Error("no key saved in Settings"));
+    if(!(window.crypto && crypto.subtle)) return Promise.reject(new Error("browser can't sign requests"));
+    var t = Math.floor(Date.now()/1000);
+    return sha1hex(k.key + k.secret + t).then(function(h){
+      return fetch("https://api.podcastindex.org/api/1.0" + path, { headers: { "X-Auth-Date": String(t), "X-Auth-Key": k.key, "Authorization": h } });
+    }).then(function(r){ if(!r.ok) throw new Error("status " + r.status); return r.json(); });
   }
   function search(term){
     say("");
@@ -191,7 +220,43 @@ input[type=range]{flex:1;height:48px;accent-color:var(--accent);background:trans
     state.show = show; state.tab = "eps"; state.eps = [];
     render();
     listEl.innerHTML = '<div class="empty">Loading episodes…</div>';
-    fetchText(show.feed).then(function(xml){
+    var viaDirectory = (/^\d+$/.test(String(show.id || ""))
+      ? lookupEps(100).catch(function(){ return lookupEps(25); })
+      : Promise.reject(new Error("no id")))
+      .catch(function(e1){
+        return piEps().catch(function(e){ throw new Error(((e1 && e1.message) || "") + "; Podcast Index: " + e.message); });
+      });
+    function piEps(){
+      return piGet("/episodes/byfeedurl?max=100&url=" + encodeURIComponent(show.feed)).then(function(j){
+        var eps = (j.items || []).filter(function(r){ return r.enclosureUrl; }).map(function(r){
+          return {
+            title: r.title || "Episode",
+            url: https(r.enclosureUrl),
+            date: r.datePublished ? new Date(r.datePublished * 1000) : null,
+            dur: r.duration ? String(r.duration) : "",
+            art: https(r.image || r.feedImage || show.art || "")
+          };
+        });
+        if(!eps.length) throw new Error("no episodes");
+        state.eps = eps; render();
+      });
+    }
+    function lookupEps(n){
+      return apiGet("https://itunes.apple.com/lookup?entity=podcastEpisode&limit=" + n + "&id=" + show.id).then(function(j){
+          var eps = (j.results || []).filter(function(r){ return r.wrapperType === "podcastEpisode" && r.episodeUrl; }).map(function(r){
+            return {
+              title: r.trackName || "Episode",
+              url: https(r.episodeUrl),
+              date: r.releaseDate ? new Date(r.releaseDate) : null,
+              dur: r.trackTimeMillis ? String(Math.round(r.trackTimeMillis/1000)) : "",
+              art: https(r.artworkUrl600 || r.artworkUrl160 || show.art || "")
+            };
+          });
+          if(!eps.length) throw new Error("directory returned no episodes");
+          state.eps = eps; render();
+        });
+    }
+    viaDirectory.catch(function(e1){ return fetchText(show.feed).then(function(xml){
       var doc = new DOMParser().parseFromString(xml, "text/xml");
       var ch = doc.querySelector("channel > title"), chImg = doc.getElementsByTagName("itunes:image")[0];
       if(ch && (!show.name || /^https?:/.test(show.name))) show.name = ch.textContent;
@@ -212,7 +277,8 @@ input[type=range]{flex:1;height:48px;accent-color:var(--accent);background:trans
         };
       }).filter(Boolean).slice(0, 100);
       render();
-    }).catch(function(e){ listEl.innerHTML = '<div class="empty">'+esc(e.message)+'</div>'; });
+    }).catch(function(e2){ throw new Error("directory: " + (e1 && e1.message) + "; feed: " + e2.message); }); })
+    .catch(function(e){ listEl.innerHTML = '<div class="empty">Could not load this show\'s episodes.<br><small>'+esc(e.message)+'</small><br>Try searching for the show again and pick another listing of it.</div>'; });
   }
 
   // ---------- rendering ----------
@@ -376,6 +442,17 @@ input[type=range]{flex:1;height:48px;accent-color:var(--accent);background:trans
     h("nexttrack", function(){ jump(90); });
     h("seekto", function(d){ if(d && d.seekTime != null) audio.currentTime = d.seekTime; });
   }
+
+  // ---------- settings ----------
+  (function(){
+    var k = load("dp.pi", null);
+    if(k){ $("piKey").value = k.key || ""; $("piSecret").value = k.secret || ""; }
+    $("piSave").onclick = function(){
+      var key = $("piKey").value.trim(), secret = $("piSecret").value.trim();
+      save("dp.pi", key && secret ? { key: key, secret: secret } : null);
+      $("piMsg").textContent = key && secret ? "Saved. Reopen a show that wouldn't load." : "Cleared.";
+    };
+  })();
 
   // ---------- resume last episode ----------
   if(last && last.ep){ playEp(last.ep, last.show, false); }
